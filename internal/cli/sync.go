@@ -576,6 +576,12 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 		if nativeReviewAgentSupported(agent) {
 			apply = append(apply, nativeReviewAgentStep{id: "sync:agent:native-review:" + string(agent), agent: agent, homeDir: r.homeDir, workspaceDir: r.workspaceDir, scope: r.scope, selection: r.selection, changedFiles: &r.changedFiles, state: r.state})
 		}
+		if agent == model.AgentCodex {
+			// Codex discovers agent roles only under CODEX_HOME (~/.codex/agents),
+			// so this step intentionally ignores scope and stays home-based even for
+			// a workspace-scoped sync. See reviewassets.CodexAgentRoleDir.
+			apply = append(apply, codexAgentRoleStep{id: "sync:agent:codex-roles:" + string(agent), agent: agent, homeDir: r.homeDir, changedFiles: &r.changedFiles, state: r.state})
+		}
 	}
 
 	// Routing guidance is refreshed per agent and outside the component loop, for
@@ -788,7 +794,16 @@ func syncBackupTargetsScoped(homeDir, workspaceDir string, scope InstallScope, s
 			paths[adapter.SystemPromptFile(componentInjectionDirScoped(homeDir, workspaceDir, scope, adapter))] = struct{}{}
 		}
 		if adapter.Agent() == model.AgentCodex {
+			// main made hooks.json scope-aware (#1074); Codex agent roles stay
+			// home-based on purpose, because Codex discovers them only under
+			// CODEX_HOME (~/.codex/agents) regardless of the install scope.
 			paths[filepath.Join(adapter.GlobalConfigDir(componentInjectionDirScoped(homeDir, workspaceDir, scope, adapter)), "hooks.json")] = struct{}{}
+			// Codex agent roles are written by the dedicated codexAgentRoleStep.
+			dir := reviewassets.CodexAgentRoleDir(homeDir)
+			paths[filepath.Join(dir, reviewassets.OwnershipLedgerFilename)] = struct{}{}
+			for _, name := range reviewassets.CodexAgentRoleNames() {
+				paths[filepath.Join(dir, name)] = struct{}{}
+			}
 		}
 	}
 	if configDir := openCodeTelemetryConfigDir(homeDir, workspaceDir, scope, selection.Agents); configDir != "" {
