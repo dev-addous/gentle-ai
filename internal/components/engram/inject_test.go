@@ -3,7 +3,9 @@ package engram
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,10 +24,573 @@ import (
 	"github.com/gentleman-programming/gentle-ai/v4/internal/agents/pi"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/agents/qwen"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/agents/vscode"
+	"github.com/gentleman-programming/gentle-ai/v4/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/model"
 )
 
+// ─── #1635 Antigravity prevalidation and write accounting tests ─────────────
+
+var errAntigravityWriteFault = errors.New("injected antigravity write fault")
+
+// antigravityWriteFixture seeds a home with a global Antigravity MCP config
+// holding an unrelated server plus a managed Engram duplicate, and returns the
+// five paths the Antigravity injection pass touches, in write order.
+func antigravityWriteFixture(t *testing.T) (home, globalPath, settingsPath, pluginPath, pluginMCPPath, hooksPath string) {
+	t.Helper()
+	home = t.TempDir()
+	cliDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	pluginDir := filepath.Join(cliDir, "plugins", "gentle-ai-engram")
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", pluginDir, err)
+	}
+	globalPath = filepath.Join(cliDir, "mcp_config.json")
+	global := `{
+  "mcpServers": {
+    "context7": {"command": "npx", "args": ["-y", "@upstash/context7-mcp"]},
+    "engram": {"command": "/usr/local/bin/engram", "args": ["mcp"]}
+  }
+}
+`
+	if err := os.WriteFile(globalPath, []byte(global), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", globalPath, err)
+	}
+	settingsPath = filepath.Join(cliDir, "settings.json")
+	pluginPath = filepath.Join(pluginDir, "plugin.json")
+	pluginMCPPath = filepath.Join(pluginDir, "mcp_config.json")
+	hooksPath = filepath.Join(pluginDir, "hooks.json")
+	return home, globalPath, settingsPath, pluginPath, pluginMCPPath, hooksPath
+}
+
+// failAntigravityWrite routes every Antigravity write through the real writer
+// on real disk, except writes whose path ends in suffix: when land is true the
+// real bytes still land and only the returned result carries the fault; when
+// land is false the real writer is never called, simulating a failure before
+// any replacement.
+func failAntigravityWrite(t *testing.T, suffix string, land bool) {
+	t.Helper()
+	orig := writeAntigravityFileAtomic
+	writeAntigravityFileAtomic = func(path string, content []byte, perm fs.FileMode) (filemerge.WriteResult, error) {
+		if !strings.HasSuffix(path, suffix) {
+			return orig(path, content, perm)
+		}
+		if !land {
+			return filemerge.WriteResult{}, errAntigravityWriteFault
+		}
+		result, err := orig(path, content, perm)
+		if err == nil {
+			err = errAntigravityWriteFault
+		}
+		return result, err
+	}
+	t.Cleanup(func() { writeAntigravityFileAtomic = orig })
+}
+
+func TestInjectAntigravityPrevalidatesGlobalMCPConfigBeforeWrites(t *testing.T) {
+	globalContent := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		content *string // nil leaves the global config missing
+		wantErr bool
+		locked  bool
+	}{
+		{name: "missing file is accepted"},
+		{name: "empty file is accepted without normalization", content: globalContent("")},
+		{name: "whitespace-only file is accepted without normalization", content: globalContent(" \t\r\n")},
+		{name: "object file is accepted", content: globalContent(`{"mcpServers":{"context7":{"command":"npx"}}}` + "\n")},
+		{name: "malformed JSON is rejected", content: globalContent(`{"mcpServers":`), wantErr: true},
+		{name: "JSON null is rejected", content: globalContent("null"), wantErr: true},
+		{name: "JSON array is rejected", content: globalContent("[]"), wantErr: true},
+		{name: "JSON string is rejected", content: globalContent(`"engram"`), wantErr: true},
+		{name: "JSON number is rejected", content: globalContent("42"), wantErr: true},
+		{name: "JSON bool is rejected", content: globalContent("true"), wantErr: true},
+		{name: "unreadable file is rejected", content: globalContent("{}\n"), wantErr: true, locked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.locked {
+				if runtime.GOOS == "windows" {
+					t.Skip("file permission bits are not supported on Windows")
+				}
+				if os.Geteuid() == 0 {
+					t.Skip("root ignores file permission bits")
+				}
+			}
+			home := t.TempDir()
+			cliDir := filepath.Join(home, ".gemini", "antigravity-cli")
+			mcpPath := filepath.Join(cliDir, "mcp_config.json")
+			if tc.content != nil {
+				if err := os.MkdirAll(cliDir, 0o755); err != nil {
+					t.Fatalf("MkdirAll(%q) error = %v", cliDir, err)
+				}
+				if err := os.WriteFile(mcpPath, []byte(*tc.content), 0o644); err != nil {
+					t.Fatalf("WriteFile(%q) error = %v", mcpPath, err)
+				}
+				if tc.locked {
+					if err := os.Chmod(mcpPath, 0o000); err != nil {
+						t.Fatalf("Chmod(%q) error = %v", mcpPath, err)
+					}
+				}
+			}
+
+			_, err := Inject(home, antigravityAdapter())
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Inject(antigravity) succeeded; want Antigravity global MCP config prevalidation error")
+				}
+				if !strings.Contains(err.Error(), "Antigravity global MCP config") {
+					t.Fatalf("error = %v, want it to name the Antigravity global MCP config", err)
+				}
+				// No mutation and no plugin activation next to unclassifiable input.
+				if _, statErr := os.Stat(filepath.Join(cliDir, "plugins", "gentle-ai-engram")); !os.IsNotExist(statErr) {
+					t.Fatalf("plugin must not be activated; stat err = %v", statErr)
+				}
+				if _, statErr := os.Stat(filepath.Join(cliDir, "settings.json")); !os.IsNotExist(statErr) {
+					t.Fatalf("settings must not be created; stat err = %v", statErr)
+				}
+				if tc.content != nil && !tc.locked {
+					got, readErr := os.ReadFile(mcpPath)
+					if readErr != nil {
+						t.Fatalf("ReadFile(%q) error = %v", mcpPath, readErr)
+					}
+					if string(got) != *tc.content {
+						t.Fatalf("global MCP config mutated\nwant:\n%s\ngot:\n%s", *tc.content, got)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Inject(antigravity) error = %v", err)
+			}
+			// Accepted input must be left byte-identical, never normalized.
+			if tc.content != nil {
+				got, readErr := os.ReadFile(mcpPath)
+				if readErr != nil {
+					t.Fatalf("ReadFile(%q) error = %v", mcpPath, readErr)
+				}
+				if string(got) != *tc.content {
+					t.Fatalf("accepted global MCP config was rewritten\nwant:\n%s\ngot:\n%s", *tc.content, got)
+				}
+			}
+			pluginMCPPath := filepath.Join(cliDir, "plugins", "gentle-ai-engram", "mcp_config.json")
+			if _, statErr := os.Stat(pluginMCPPath); statErr != nil {
+				t.Fatalf("plugin must be activated for accepted input; stat err = %v", statErr)
+			}
+		})
+	}
+}
+
+func TestInjectAntigravityAccountsEachWriteFailure(t *testing.T) {
+	cliMCPSuffix := filepath.Join(".gemini", "antigravity-cli", "mcp_config.json")
+	for _, tc := range []struct {
+		name   string
+		suffix string
+		land   bool
+	}{
+		{name: "global rewrite failing before replacement", suffix: cliMCPSuffix},
+		{name: "global rewrite failing after landing", suffix: cliMCPSuffix, land: true},
+		{name: "settings bootstrap failing before replacement", suffix: filepath.Join(".gemini", "antigravity-cli", "settings.json")},
+		{name: "settings bootstrap failing after landing", suffix: filepath.Join(".gemini", "antigravity-cli", "settings.json"), land: true},
+		{name: "plugin manifest failing before replacement", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "plugin.json")},
+		{name: "plugin manifest failing after landing", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "plugin.json"), land: true},
+		{name: "plugin MCP config failing before replacement", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "mcp_config.json")},
+		{name: "plugin MCP config failing after landing", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "mcp_config.json"), land: true},
+		{name: "plugin hooks failing before replacement", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "hooks.json")},
+		{name: "plugin hooks failing after landing", suffix: filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "hooks.json"), land: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, globalPath, settingsPath, pluginPath, pluginMCPPath, hooksPath := antigravityWriteFixture(t)
+			order := []string{globalPath, settingsPath, pluginPath, pluginMCPPath, hooksPath}
+			target := -1
+			for i, path := range order {
+				if strings.HasSuffix(path, tc.suffix) {
+					target = i
+					break
+				}
+			}
+			if target < 0 {
+				t.Fatalf("fault suffix %q matched no fixture path", tc.suffix)
+			}
+			failAntigravityWrite(t, tc.suffix, tc.land)
+			wantCount := target
+			if tc.land {
+				wantCount++
+			}
+			wantFiles := order[:wantCount]
+
+			result, err := Inject(home, antigravityAdapter())
+
+			if err == nil {
+				t.Fatalf("Inject(antigravity) succeeded; want the injected write fault")
+			}
+			if !strings.Contains(err.Error(), errAntigravityWriteFault.Error()) {
+				t.Fatalf("error = %v, want the injected write fault", err)
+			}
+			// A landed replacement is accounted even alongside the error; a
+			// failure before replacement must not claim any file mutation.
+			if result.Changed != (wantCount > 0) {
+				t.Fatalf("result.Changed = %v, want %v", result.Changed, wantCount > 0)
+			}
+			if len(result.Files) != len(wantFiles) {
+				t.Fatalf("result.Files = %v, want %v", result.Files, wantFiles)
+			}
+			for i, want := range wantFiles {
+				if result.Files[i] != want {
+					t.Fatalf("result.Files[%d] = %q, want %q (all: %v)", i, result.Files[i], want, result.Files)
+				}
+			}
+			for i, path := range order {
+				if i >= wantCount {
+					if i == 0 && target == 0 && !tc.land {
+						// The global config pre-exists; a failure before the
+						// rewrite must leave its original bytes on disk.
+						raw, readErr := os.ReadFile(path)
+						if readErr != nil {
+							t.Fatalf("ReadFile(%q) error = %v", path, readErr)
+						}
+						if !strings.Contains(string(raw), "/usr/local/bin/engram") || !strings.Contains(string(raw), "context7") {
+							t.Fatalf("untouched global MCP config must keep its original bytes:\n%s", raw)
+						}
+						continue
+					}
+					if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+						t.Fatalf("%q must not be touched; stat err = %v", path, statErr)
+					}
+					continue
+				}
+				if i >= 2 { // #1635 UNIT2: a plugin asset landed, but recovery restored
+					// the newly created file to its absent before-image; the write is
+					// still accounted in result.Files above.
+					if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+						t.Fatalf("%q was newly created and must be restored to absent; stat err = %v", path, statErr)
+					}
+					continue
+				}
+				raw, readErr := os.ReadFile(path)
+				if readErr != nil {
+					t.Fatalf("ReadFile(%q) error = %v", path, readErr)
+				}
+				switch i {
+				case 0: // global rewrite landed: managed duplicate gone, unrelated server kept
+					if strings.Contains(string(raw), "/usr/local/bin/engram") || !strings.Contains(string(raw), "context7") {
+						t.Fatalf("global MCP config on disk wrong after landed rewrite:\n%s", raw)
+					}
+				case 1: // settings bootstrap landed: empty JSON object
+					if strings.TrimSpace(string(raw)) != "{}" {
+						t.Fatalf("settings on disk = %q, want empty JSON object", raw)
+					}
+				}
+			}
+		})
+	}
+}
+
+// ─── #1635 UNIT2 Antigravity plugin before-image and recovery tests ──────────
+
+// antigravityRecoveryFixture seeds a home whose plugin directory already holds
+// user-owned plugin assets (custom bytes, non-default modes), one absent
+// plugin asset, and an unrelated third-party file. It returns the paths the
+// recovery tests assert against plus the before-image of every seeded asset.
+func antigravityRecoveryFixture(t *testing.T) (home, settingsPath, pluginDir, pluginPath, pluginMCPPath, hooksPath, unrelatedPath string, before map[string]antigravityAssetBackup) {
+	t.Helper()
+	home = t.TempDir()
+	cliDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	pluginDir = filepath.Join(cliDir, "plugins", "gentle-ai-engram")
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", pluginDir, err)
+	}
+	settingsPath = filepath.Join(cliDir, "settings.json")
+	pluginPath = filepath.Join(pluginDir, "plugin.json")
+	pluginMCPPath = filepath.Join(pluginDir, "mcp_config.json")
+	hooksPath = filepath.Join(pluginDir, "hooks.json")
+	unrelatedPath = filepath.Join(pluginDir, "user-notes.txt")
+
+	before = make(map[string]antigravityAssetBackup)
+	write := func(path, content string, mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", path, err)
+		}
+		if runtime.GOOS != "windows" {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatalf("Chmod(%q) error = %v", path, err)
+			}
+		}
+		snapshot, err := captureAntigravityPluginAsset(path)
+		if err != nil {
+			t.Fatalf("captureAntigravityPluginAsset(%q) error = %v", path, err)
+		}
+		before[path] = snapshot
+	}
+	write(pluginPath, "{\n  \"name\": \"gentle-ai-engram\",\n  \"user\": true\n}\n", 0o640)
+	write(pluginMCPPath, `{"mcpServers":{"engram":{"command":"/custom/engram","args":["mcp"]}}}`+"\n", 0o600)
+	write(unrelatedPath, "user notes\n", 0o644)
+	// hooks.json is deliberately absent so recovery exercises both preexisting
+	// and newly created assets.
+	if _, err := os.Stat(hooksPath); !os.IsNotExist(err) {
+		t.Fatalf("hooks.json must be absent in this fixture; stat err = %v", err)
+	}
+	return home, settingsPath, pluginDir, pluginPath, pluginMCPPath, hooksPath, unrelatedPath, before
+}
+
+// assertAntigravityAssetState asserts the actual on-disk state of one asset
+// against its recorded before-image: existence, type, exact bytes, and mode.
+func assertAntigravityAssetState(t *testing.T, label, path string, want antigravityAssetBackup) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if !want.existed {
+		if !os.IsNotExist(err) {
+			t.Fatalf("%s: %q must not exist; stat err = %v", label, path, err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("%s: %q missing; stat err = %v", label, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("%s: %q is not a regular file: %v", label, path, info.Mode())
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("%s: ReadFile(%q) error = %v", label, path, readErr)
+	}
+	if !bytes.Equal(got, want.content) {
+		t.Fatalf("%s: %q bytes changed\nwant:\n%s\ngot:\n%s", label, path, want.content, got)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != want.mode {
+		t.Fatalf("%s: %q mode = %04o, want %04o", label, path, info.Mode().Perm(), want.mode)
+	}
+}
+
+func TestInjectAntigravityRejectsUnclassifiablePluginAssetBeforeWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, hooksPath, pluginPath string)
+		skip  string
+	}{
+		{
+			name: "directory where hooks.json belongs",
+			plant: func(t *testing.T, hooksPath, _ string) {
+				if err := os.Mkdir(hooksPath, 0o755); err != nil {
+					t.Fatalf("Mkdir(%q) error = %v", hooksPath, err)
+				}
+			},
+		},
+		{
+			name: "symlink where hooks.json belongs",
+			plant: func(t *testing.T, hooksPath, pluginPath string) {
+				if err := os.Symlink(pluginPath, hooksPath); err != nil {
+					t.Fatalf("Symlink(%q) error = %v", hooksPath, err)
+				}
+			},
+		},
+		{
+			name: "unreadable hooks.json",
+			skip: "permission bits",
+			plant: func(t *testing.T, hooksPath, _ string) {
+				if err := os.WriteFile(hooksPath, []byte("{}\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile(%q) error = %v", hooksPath, err)
+				}
+				if err := os.Chmod(hooksPath, 0o000); err != nil {
+					t.Fatalf("Chmod(%q) error = %v", hooksPath, err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip != "" {
+				if runtime.GOOS == "windows" {
+					t.Skip("file permission bits are not supported on Windows")
+				}
+				if os.Geteuid() == 0 {
+					t.Skip("root ignores file permission bits")
+				}
+			}
+			home, _, _, pluginPath, pluginMCPPath, hooksPath, unrelatedPath, before := antigravityRecoveryFixture(t)
+			tc.plant(t, hooksPath, pluginPath)
+
+			_, err := Inject(home, antigravityAdapter())
+			if err == nil {
+				t.Fatalf("Inject(antigravity) succeeded; want a plugin asset classification error")
+			}
+			if !strings.Contains(err.Error(), hooksPath) || !strings.Contains(err.Error(), "plugin asset") {
+				t.Fatalf("error = %v, want it to name the unclassifiable plugin asset %q", err, hooksPath)
+			}
+			// The rejection happens before any plugin write: every preexisting
+			// asset keeps its exact bytes and mode, and the unsupported asset is
+			// never written through or removed.
+			assertAntigravityAssetState(t, "preserved", pluginPath, before[pluginPath])
+			assertAntigravityAssetState(t, "preserved", pluginMCPPath, before[pluginMCPPath])
+			assertAntigravityAssetState(t, "preserved", unrelatedPath, before[unrelatedPath])
+			info, statErr := os.Lstat(hooksPath)
+			if statErr != nil {
+				t.Fatalf("Lstat(%q) error = %v", hooksPath, statErr)
+			}
+			if tc.name == "directory where hooks.json belongs" && !info.IsDir() {
+				t.Fatalf("hooks.json directory was replaced: %v", info.Mode())
+			}
+			if tc.name == "symlink where hooks.json belongs" && info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("hooks.json symlink was replaced: %v", info.Mode())
+			}
+		})
+	}
+}
+
+func TestInjectAntigravityRestoresTouchedPluginAssetsToExactBeforeImage(t *testing.T) {
+	pluginAssetOrder := []string{"plugin.json", "mcp_config.json", "hooks.json"}
+	for _, tc := range []struct {
+		name   string
+		suffix string
+		land   bool
+	}{
+		{name: "manifest failing before replacement", suffix: pluginAssetOrder[0]},
+		{name: "manifest failing after landing", suffix: pluginAssetOrder[0], land: true},
+		{name: "MCP config failing before replacement", suffix: pluginAssetOrder[1]},
+		{name: "MCP config failing after landing", suffix: pluginAssetOrder[1], land: true},
+		{name: "hooks failing before replacement", suffix: pluginAssetOrder[2]},
+		{name: "hooks failing after landing", suffix: pluginAssetOrder[2], land: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, settingsPath, pluginDir, pluginPath, pluginMCPPath, hooksPath, unrelatedPath, before := antigravityRecoveryFixture(t)
+			paths := map[string]string{
+				pluginAssetOrder[0]: pluginPath,
+				pluginAssetOrder[1]: pluginMCPPath,
+				pluginAssetOrder[2]: hooksPath,
+			}
+			failAntigravityWrite(t, filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", tc.suffix), tc.land)
+
+			result, err := Inject(home, antigravityAdapter())
+
+			if err == nil {
+				t.Fatalf("Inject(antigravity) succeeded; want the injected write fault")
+			}
+			if !errors.Is(err, errAntigravityWriteFault) {
+				t.Fatalf("error = %v, want errors.Is(err, errAntigravityWriteFault)", err)
+			}
+			// Only the plugin write fails, so the settings bootstrap before it
+			// landed, and every plugin write up to and including the faulted one
+			// occurred — recovery restores the assets but must not erase the
+			// accounting of mutations that happened.
+			wantFiles := []string{settingsPath}
+			for _, name := range pluginAssetOrder {
+				wantFiles = append(wantFiles, paths[name])
+				if name == tc.suffix {
+					if !tc.land {
+						wantFiles = wantFiles[:len(wantFiles)-1]
+					}
+					break
+				}
+			}
+			if !result.Changed {
+				t.Fatalf("result.Changed = false; the settings creation and landed plugin writes are real mutations")
+			}
+			if len(result.Files) != len(wantFiles) {
+				t.Fatalf("result.Files = %v, want %v", result.Files, wantFiles)
+			}
+			for i, want := range wantFiles {
+				if result.Files[i] != want {
+					t.Fatalf("result.Files[%d] = %q, want %q (all: %v)", i, result.Files[i], want, result.Files)
+				}
+			}
+			// Every touched plugin asset is back to its exact before-image:
+			// preexisting bytes and mode, absent for newly created files.
+			for _, name := range pluginAssetOrder {
+				assertAntigravityAssetState(t, "restored", paths[name], before[paths[name]])
+			}
+			// The unrelated third-party asset and the plugin directory itself
+			// are never part of any restore.
+			assertAntigravityAssetState(t, "unrelated", unrelatedPath, before[unrelatedPath])
+			info, statErr := os.Stat(pluginDir)
+			if statErr != nil || !info.IsDir() {
+				t.Fatalf("plugin directory must survive recovery; stat err = %v", statErr)
+			}
+		})
+	}
+}
+
+func TestInjectAntigravityRecoveryFailureIsExplicit(t *testing.T) {
+	t.Run("restoration write failure", func(t *testing.T) {
+		home, settingsPath, _, pluginPath, pluginMCPPath, hooksPath, _, _ := antigravityRecoveryFixture(t)
+		failAntigravityWrite(t, filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "hooks.json"), true)
+		restoreFault := errors.New("injected antigravity restore fault")
+		origRestore := restoreAntigravityFileAtomic
+		restoreAntigravityFileAtomic = func(path string, content []byte, perm fs.FileMode) (filemerge.WriteResult, error) {
+			return filemerge.WriteResult{}, restoreFault
+		}
+		t.Cleanup(func() { restoreAntigravityFileAtomic = origRestore })
+
+		result, err := Inject(home, antigravityAdapter())
+
+		if err == nil {
+			t.Fatalf("Inject(antigravity) succeeded; want the injected write fault")
+		}
+		// Both the original write error and the recovery error must survive.
+		if !errors.Is(err, errAntigravityWriteFault) {
+			t.Fatalf("error must preserve the original write fault: %v", err)
+		}
+		if !errors.Is(err, restoreFault) {
+			t.Fatalf("error must preserve the restoration failure: %v", err)
+		}
+		if !strings.Contains(err.Error(), "could not be confirmed") {
+			t.Fatalf("error must state the final plugin state could not be confirmed: %v", err)
+		}
+		// The landed writes are still accounted even though recovery failed.
+		wantFiles := []string{settingsPath, pluginPath, pluginMCPPath, hooksPath}
+		if !result.Changed || len(result.Files) != len(wantFiles) {
+			t.Fatalf("result = %+v, want Changed with Files %v", result, wantFiles)
+		}
+		for i, want := range wantFiles {
+			if result.Files[i] != want {
+				t.Fatalf("result.Files[%d] = %q, want %q (all: %v)", i, result.Files[i], want, result.Files)
+			}
+		}
+		// Restoration was refused for the preexisting assets, so they still
+		// hold the injected canonical bytes; the newly created hooks file
+		// was still removable. This is reported, never claimed as success.
+		if got, readErr := os.ReadFile(pluginPath); readErr != nil || string(got) != antigravityEngramPluginJSON {
+			t.Fatalf("plugin manifest must still hold the landed canonical bytes while restoration is broken; got %q, err %v", got, readErr)
+		}
+		if _, statErr := os.Stat(hooksPath); !os.IsNotExist(statErr) {
+			t.Fatalf("newly created hooks.json must still be removed by recovery; stat err = %v", statErr)
+		}
+	})
+
+	t.Run("recovery readback failure", func(t *testing.T) {
+		home, _, _, _, _, _, _, before := antigravityRecoveryFixture(t)
+		failAntigravityWrite(t, filepath.Join(".gemini", "antigravity-cli", "plugins", "gentle-ai-engram", "hooks.json"), true)
+		readbackFault := errors.New("injected antigravity readback fault")
+		origRead := readAntigravityPluginAsset
+		readAntigravityPluginAsset = func(path string) (antigravityAssetBackup, error) {
+			return antigravityAssetBackup{}, readbackFault
+		}
+		t.Cleanup(func() { readAntigravityPluginAsset = origRead })
+
+		result, err := Inject(home, antigravityAdapter())
+
+		if err == nil {
+			t.Fatalf("Inject(antigravity) succeeded; want the injected write fault")
+		}
+		if !errors.Is(err, errAntigravityWriteFault) {
+			t.Fatalf("error must preserve the original write fault: %v", err)
+		}
+		if !errors.Is(err, readbackFault) {
+			t.Fatalf("error must preserve the readback failure: %v", err)
+		}
+		if !strings.Contains(err.Error(), "could not be confirmed") {
+			t.Fatalf("error must state the final plugin state could not be confirmed: %v", err)
+		}
+		if !result.Changed {
+			t.Fatalf("result.Changed = false; the landed writes are real mutations")
+		}
+		// Restoration itself succeeded: every asset matches its before-image,
+		// but the failed readback means recovery still refuses to claim it.
+		for path, want := range before {
+			assertAntigravityAssetState(t, "restored", path, want)
+		}
+	})
+}
+
 func TestEngramSelectedSettingsRefuseNestedCommentsAndLockedMode(t *testing.T) {
+
 	for _, tc := range []struct {
 		name, content string
 		mode          os.FileMode
@@ -360,69 +925,55 @@ func TestInjectOpenCodeIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestInjectPiProvisioningCreatesMissingMCPAdapterFiles(t *testing.T) {
+func TestInjectPiProvisioningWritesNoMCPAdapterOnFreshHome(t *testing.T) {
 	home := t.TempDir()
 
 	result, err := Inject(home, piAdapter())
 	if err != nil {
 		t.Fatalf("Inject() error = %v", err)
 	}
-	if !result.Changed {
-		t.Fatalf("Inject() changed = false")
+	if result.Changed {
+		t.Fatalf("Inject() changed = true, want false (Pi's built-in MCP needs no adapter)")
 	}
-
-	settings := readJSONFile(t, filepath.Join(home, ".pi", "agent", "settings.json"))
-	assertNestedStrings(t, settings, []string{"npm:pi-mcp-adapter"}, "packages")
-
-	npmPackage := readJSONFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"))
-	assertNestedString(t, npmPackage, "^2.6.0", "dependencies", "pi-mcp-adapter")
+	for _, path := range []string{
+		filepath.Join(home, ".pi", "agent", "settings.json"),
+		filepath.Join(home, ".pi", "agent", "npm", "package.json"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stat %q err = %v, want IsNotExist", path, err)
+		}
+	}
 }
 
-func TestInjectPiProvisioningPreservesUnrelatedContent(t *testing.T) {
+func TestInjectPiProvisioningRetiresMCPAdapterAndPreservesUnrelatedContent(t *testing.T) {
 	home := t.TempDir()
-	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"theme":"kanagawa","packages":["npm:other@1.0.0"]}`)
-	writeFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"), `{"name":"pi-user","dependencies":{"left-pad":"^1.0.0"},"devDependencies":{"vitest":"^1.0.0"}}`)
+	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"theme":"kanagawa","packages":["npm:other@1.0.0","npm:pi-mcp-adapter@2.0.0"]}`)
+	writeFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"), `{"name":"pi-user","dependencies":{"left-pad":"^1.0.0","pi-mcp-adapter":"^2.6.0"},"devDependencies":{"vitest":"^1.0.0"}}`)
 
-	_, err := Inject(home, piAdapter())
+	first, err := Inject(home, piAdapter())
 	if err != nil {
 		t.Fatalf("Inject() error = %v", err)
+	}
+	if !first.Changed {
+		t.Fatalf("Inject() changed = false, want the adapter retired")
 	}
 
 	settings := readJSONFile(t, filepath.Join(home, ".pi", "agent", "settings.json"))
 	assertNestedString(t, settings, "kanagawa", "theme")
-	assertNestedStringsUnordered(t, settings, []string{"npm:other@1.0.0", "npm:pi-mcp-adapter"}, "packages")
+	assertNestedStrings(t, settings, []string{"npm:other@1.0.0"}, "packages")
 
 	npmPackage := readJSONFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"))
 	assertNestedString(t, npmPackage, "pi-user", "name")
 	assertNestedString(t, npmPackage, "^1.0.0", "dependencies", "left-pad")
-	assertNestedString(t, npmPackage, "^2.6.0", "dependencies", "pi-mcp-adapter")
+	assertNestedMissing(t, npmPackage, "dependencies", "pi-mcp-adapter")
 	assertNestedString(t, npmPackage, "^1.0.0", "devDependencies", "vitest")
-}
-
-func TestInjectPiProvisioningCanonicalizesExistingEntriesAndIsIdempotent(t *testing.T) {
-	home := t.TempDir()
-	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"packages":["npm:pi-mcp-adapter@2.0.0"]}`)
-	writeFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"), `{"dependencies":{"pi-mcp-adapter":"^2.0.0"}}`)
-
-	first, err := Inject(home, piAdapter())
-	if err != nil {
-		t.Fatalf("Inject() first error = %v", err)
-	}
-	if !first.Changed {
-		t.Fatalf("Inject() first changed = false")
-	}
-
-	settings := readJSONFile(t, filepath.Join(home, ".pi", "agent", "settings.json"))
-	assertNestedStrings(t, settings, []string{"npm:pi-mcp-adapter"}, "packages")
-	npmPackage := readJSONFile(t, filepath.Join(home, ".pi", "agent", "npm", "package.json"))
-	assertNestedString(t, npmPackage, "^2.6.0", "dependencies", "pi-mcp-adapter")
 
 	second, err := Inject(home, piAdapter())
 	if err != nil {
 		t.Fatalf("Inject() second error = %v", err)
 	}
 	if second.Changed {
-		t.Fatalf("Inject() second changed = true")
+		t.Fatalf("Inject() second changed = true, want idempotent no-op")
 	}
 }
 
@@ -437,7 +988,7 @@ func TestInjectPiProvisioningMigratesLegacyObjectPackages(t *testing.T) {
 
 	settings := readJSONFile(t, filepath.Join(home, ".pi", "agent", "settings.json"))
 	assertNestedString(t, settings, "kanagawa", "theme")
-	assertNestedStringsUnordered(t, settings, []string{"npm:other@1.0.0", "npm:pi-mcp-adapter"}, "packages")
+	assertNestedStrings(t, settings, []string{"npm:other@1.0.0"}, "packages")
 }
 
 // TestInjectOpenCodeMigratesFromOldFormat verifies that when a user's
@@ -2036,37 +2587,6 @@ func assertNestedStrings(t *testing.T, root map[string]any, want []string, path 
 	for i, wantItem := range want {
 		if items[i] != wantItem {
 			t.Fatalf("JSON path %v[%d] = %#v, want %q", path, i, items[i], wantItem)
-		}
-	}
-}
-
-func assertNestedStringsUnordered(t *testing.T, root map[string]any, want []string, path ...string) {
-	t.Helper()
-	got, ok := nestedValue(t, root, path...)
-	if !ok {
-		t.Fatalf("missing JSON path %v in %#v", path, root)
-	}
-	items, ok := got.([]any)
-	if !ok {
-		t.Fatalf("JSON path %v = %#v, want string array", path, got)
-	}
-	if len(items) != len(want) {
-		t.Fatalf("JSON path %v length = %d, want %d (%#v)", path, len(items), len(want), got)
-	}
-	remaining := make(map[string]int, len(want))
-	for _, item := range want {
-		remaining[item]++
-	}
-	for _, item := range items {
-		itemString, ok := item.(string)
-		if !ok {
-			t.Fatalf("JSON path %v contains non-string item %#v", path, item)
-		}
-		remaining[itemString]--
-	}
-	for item, count := range remaining {
-		if count != 0 {
-			t.Fatalf("JSON path %v missing/extra %q count delta %d; got %#v", path, item, count, got)
 		}
 	}
 }
